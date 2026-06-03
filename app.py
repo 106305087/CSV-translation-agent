@@ -4,8 +4,8 @@ import pandas as pd
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 from src.csv_loader import load_csv
-from src.column_detector import detect_text_columns, detect_chinese_columns
-from src.intent_parser import parse_intent, IntentResult
+from src.column_detector import build_column_samples
+from src.intent_parser import parse_intent, IntentResult, ColumnTarget
 from src.translator import translate_column
 from src.exporter import build_export_csv
 from src.validators import validate_file, validate_columns, validate_languages
@@ -35,8 +35,6 @@ def _init_state():
     defaults = {
         "df": None,
         "profile": None,
-        "candidates": [],
-        "chinese_cols": [],
         "chat_history": [],
         "intent": None,
         "translated_cols": {},
@@ -44,8 +42,7 @@ def _init_state():
         "translation_error": None,
         "awaiting_selection": False,
         "translating": False,
-        "prefill_cols": [],
-        "prefill_langs": [],
+        "prefill_targets": {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -55,13 +52,14 @@ _init_state()
 
 # Transfer NL prefills into widget keys before any widget is instantiated.
 # Streamlit ignores `default` when a key already exists in session_state, so we
-# write the values here — top of script, before widgets render.
-if st.session_state.prefill_cols:
-    st.session_state["col_sel_widget"] = st.session_state.prefill_cols
-    st.session_state.prefill_cols = []
-if st.session_state.prefill_langs:
-    st.session_state["lang_sel_widget"] = st.session_state.prefill_langs
-    st.session_state.prefill_langs = []
+# write the values here — top of script, before widgets render. `prefill_targets`
+# maps each column to its list of (display-name) languages.
+if st.session_state.prefill_targets:
+    targets = st.session_state.prefill_targets
+    st.session_state["col_sel_widget"] = list(targets.keys())
+    for col, langs in targets.items():
+        st.session_state[f"lang_sel_{col}"] = langs
+    st.session_state.prefill_targets = {}
 
 
 # ── Translation runner ─────────────────────────────────────────────────────────
@@ -70,15 +68,16 @@ def _run_translation():
     df = st.session_state.df
     new_cols: dict[str, pd.Series] = {}
 
-    total_ops = len(intent.columns) * len(intent.language_codes)
+    total_ops = sum(len(ct.language_codes) for ct in intent.column_targets)
     op_idx = 0
     overall_bar = st.progress(0.0, text="Starting translation…")
     status_text = st.empty()
     ctx = get_script_run_ctx()
     bar_pct = [0.0]
 
-    for col in intent.columns:
-        for lang_code, lang_name in zip(intent.language_codes, intent.target_languages):
+    for ct in intent.column_targets:
+        col = ct.column
+        for lang_code, lang_name in zip(ct.language_codes, ct.target_languages):
             op_idx += 1
             out_col = f"{col}_{lang_code}"
 
@@ -162,39 +161,21 @@ if uploaded is not None:
         try:
             df, profile = load_csv(file_bytes, filename=uploaded.name)
             validate_file(df)
-            candidates = detect_text_columns(df)
-            chinese_cols = detect_chinese_columns(df)
 
             st.session_state.df = df
             st.session_state.profile = profile
-            st.session_state.candidates = candidates
-            st.session_state.chinese_cols = chinese_cols
             st.session_state.intent = None
             st.session_state.translated_cols = {}
             st.session_state.export_bytes = None
             st.session_state.translation_error = None
             st.session_state.awaiting_selection = False
-            st.session_state.prefill_cols = []
-            st.session_state.prefill_langs = []
-            st.session_state.pop("col_sel_widget", None)
-            st.session_state.pop("lang_sel_widget", None)
-
-            col_hint = ""
-            if chinese_cols:
-                col_hint = (
-                    f" I detected {len(chinese_cols)} Chinese column(s): "
-                    + ", ".join(f"`{c}`" for c in chinese_cols) + "."
-                )
-            elif candidates:
-                col_hint = (
-                    f" I detected {len(candidates)} likely text column(s): "
-                    + ", ".join(f"`{c}`" for c in candidates) + "."
-                )
+            st.session_state.prefill_targets = {}
+            for k in [k for k in st.session_state if k == "col_sel_widget" or k.startswith("lang_sel_")]:
+                st.session_state.pop(k, None)
 
             greeting = (
                 f"I loaded **{uploaded.name}** — "
-                f"**{profile['rows']:,} rows**, **{profile['columns']} columns**."
-                f"{col_hint}\n\n"
+                f"**{profile['rows']:,} rows**, **{profile['columns']} columns**.\n\n"
                 "**Which column(s) would you like to translate, and into what language(s)?**"
             )
             st.session_state.chat_history = [{"role": "assistant", "content": greeting}]
@@ -224,22 +205,33 @@ if st.session_state.awaiting_selection and st.session_state.df is not None:
             key="col_sel_widget",
         )
         lang_options = [lang.title() for lang in LANGUAGE_MAP.keys()]
-        lang_sel = st.multiselect(
-            "Target language(s):",
-            options=lang_options,
-            key="lang_sel_widget",
-        )
 
-        if st.button("Start Translating", type="primary", disabled=not col_sel or not lang_sel):
+        # One language picker per selected column, so each column maps to its own targets.
+        per_col_langs: dict[str, list[str]] = {}
+        for col in col_sel:
+            per_col_langs[col] = st.multiselect(
+                f"Target language(s) for `{col}`:",
+                options=lang_options,
+                key=f"lang_sel_{col}",
+            )
+
+        ready = bool(col_sel) and all(per_col_langs[c] for c in col_sel)
+        if st.button("Start Translating", type="primary", disabled=not ready):
             try:
                 validate_columns(col_sel, profile["col_names"])
-                lang_codes = [LANGUAGE_MAP[lang.lower()] for lang in lang_sel]
-                validate_languages(lang_codes)
+                column_targets = []
+                for col in col_sel:
+                    lang_sel = per_col_langs[col]
+                    lang_codes = [LANGUAGE_MAP[lang.lower()] for lang in lang_sel]
+                    validate_languages(lang_codes)
+                    column_targets.append(ColumnTarget(
+                        column=col,
+                        target_languages=lang_sel,
+                        language_codes=lang_codes,
+                    ))
 
                 st.session_state.intent = IntentResult(
-                    columns=col_sel,
-                    target_languages=lang_sel,
-                    language_codes=lang_codes,
+                    column_targets=column_targets,
                     needs_clarification=False,
                     clarification_question=None,
                 )
@@ -272,7 +264,7 @@ if st.session_state.df is not None:
                     intent = parse_intent(
                         user_input,
                         st.session_state.profile["col_names"],
-                        st.session_state.candidates,
+                        build_column_samples(st.session_state.df),
                         previous_intent=st.session_state.intent,
                         chat_history=st.session_state.chat_history,
                     )
@@ -283,11 +275,17 @@ if st.session_state.df is not None:
                         st.session_state.chat_history.append({"role": "assistant", "content": reply})
                         st.session_state.intent = intent
                     else:
-                        validate_columns(intent.columns, st.session_state.profile["col_names"])
-                        validate_languages(intent.language_codes)
+                        validate_columns(
+                            [ct.column for ct in intent.column_targets],
+                            st.session_state.profile["col_names"],
+                        )
+                        validate_languages(
+                            [c for ct in intent.column_targets for c in ct.language_codes]
+                        )
 
-                        st.session_state.prefill_cols = intent.columns
-                        st.session_state.prefill_langs = intent.target_languages
+                        st.session_state.prefill_targets = {
+                            ct.column: ct.target_languages for ct in intent.column_targets
+                        }
                         st.session_state.awaiting_selection = True
 
                         reply = (
@@ -310,12 +308,13 @@ if st.session_state.translated_cols and st.session_state.export_bytes and not st
     intent = st.session_state.intent
 
     preview_cols = []
-    for col in intent.columns:
-        if col in df.columns:
+    for ct in intent.column_targets:
+        col = ct.column
+        if col in df.columns and col not in preview_cols:
             preview_cols.append(col)
-        for lc in intent.language_codes:
+        for lc in ct.language_codes:
             out = f"{col}_{lc}"
-            if out in st.session_state.translated_cols:
+            if out in st.session_state.translated_cols and out not in preview_cols:
                 preview_cols.append(out)
 
     base_cols = [c for c in preview_cols if c in df.columns]

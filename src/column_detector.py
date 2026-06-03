@@ -56,3 +56,21 @@ def detect_chinese_columns(df: pd.DataFrame) -> list[str]:
         col for col in df.columns
         if df[col].dtype in (object, "string") and _chinese_ratio(df[col]) > 0.3
     ]
+
+
+def build_column_samples(
+    df: pd.DataFrame, n_rows: int = 10, max_chars: int = 200
+) -> dict[str, list[str]]:
+    """First ``n_rows`` non-null values of each text (object/string) column.
+
+    Numeric/float/bool/datetime columns are dropped (dtype-only filter), so GPT
+    only sees translatable text columns. Long cells are truncated to ``max_chars``
+    to keep token usage bounded.
+    """
+    samples: dict[str, list[str]] = {}
+    for col in df.columns:
+        if df[col].dtype not in (object, "string"):
+            continue
+        vals = df[col].dropna().astype(str).head(n_rows)
+        samples[col] = [v[:max_chars] for v in vals]
+    return samples
